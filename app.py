@@ -122,6 +122,8 @@ if "resume_session_id" not in st.session_state:
     st.session_state.resume_session_id = None
 if "pending_resume" not in st.session_state:
     st.session_state.pending_resume = False
+if "picker_version" not in st.session_state:
+    st.session_state.picker_version = 0
 
 
 SYSTEM_USER_TAGS = (
@@ -424,6 +426,11 @@ def reset_conversation_state() -> None:
     st.session_state.pending_prompt = None
     st.session_state.resume_session_id = None
     st.session_state.pending_resume = False
+    st.session_state.picker_version += 1
+    # Drop the sidebar selectbox's persisted value — otherwise on the next rerun
+    # it returns the previously-selected session label and the picker's `else`
+    # branch reloads its messages from disk, masking the clear.
+    st.session_state.pop(f"session_picker_{st.session_state.working_dir}", None)
 
 def fmt_int(n: int) -> str:
     return f"{n:,}"
@@ -497,7 +504,7 @@ with st.sidebar:
         "Resume session",
         labels,
         index=current,
-        key=f"session_picker_{working_dir}",
+        key=f"session_picker_{working_dir}_{st.session_state.picker_version}",
         disabled=picker_disabled,
         help="Pick a previous session to resume in this directory, or start fresh.",
     )
@@ -521,19 +528,6 @@ with st.sidebar:
             st.session_state.pending_prompt = None
             st.session_state._scroll_bottom = True
             st.rerun()
-    st.divider()
-
-    clear_disabled = st.session_state.pending_prompt is not None
-    if st.button("Clear conversation", use_container_width=True, disabled=clear_disabled):
-        st.session_state.messages.append(
-            {
-                "role": "user",
-                "content": "/clear",
-                "ts": datetime.now().strftime("%H:%M:%S"),
-            }
-        )
-        st.session_state.pending_prompt = "/clear"
-        st.rerun()
     st.divider()
 
     st.subheader("Session Tokens")
@@ -636,6 +630,11 @@ is_running = st.session_state.pending_prompt is not None
 
 
 def _submit_message(text: str) -> None:
+    if text.strip() == "/clear":
+        reset_conversation_state()
+        st.session_state._scroll_bottom = True
+        st.rerun()
+        return
     st.session_state.messages.append(
         {"role": "user", "content": text, "ts": datetime.now().strftime("%H:%M:%S")}
     )
