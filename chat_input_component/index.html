@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; background: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    color: #e5e7eb;
+    overflow: visible;
+    height: 100%;
+  }
+  /* Push the input row to the bottom of the iframe so the popup,
+     which opens upward (position: absolute; bottom: calc(100% + 6px)),
+     stays within the iframe bounds and isn't clipped by the browser. */
+  body {
+    display: flex;
+    flex-direction: column;
+    justify-content: flex-end;
+  }
+
+  /* Dark scrollbars — Webkit */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: #374151;
+    border-radius: 8px;
+    border: 2px solid #1f2937;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: #4b5563; }
+  ::-webkit-scrollbar-corner { background: transparent; }
+  /* Dark scrollbars — Firefox */
+  * { scrollbar-color: #374151 transparent; scrollbar-width: thin; }
+  .wrap {
+    position: relative;
+    display: flex;
+    gap: 8px;
+    align-items: stretch;
+    padding: 2px 0;
+  }
+  textarea {
+    flex: 1 1 auto;
+    resize: none;
+    background: #1f2937;
+    color: #e5e7eb;
+    border: 1px solid #374151;
+    border-radius: 12px;
+    padding: 12px 14px;
+    font-size: 14px;
+    line-height: 1.5;
+    font-family: inherit;
+    min-height: 46px;
+    max-height: 220px;
+    overflow-y: auto;
+    outline: none;
+    transition: border-color 120ms;
+  }
+  textarea:focus { border-color: #2563eb; }
+  textarea:disabled { opacity: 0.55; cursor: not-allowed; }
+
+  button {
+    flex: 0 0 46px;
+    height: 46px;
+    align-self: flex-end;
+    background: #2563eb;
+    color: #fff;
+    border: none;
+    border-radius: 12px;
+    cursor: pointer;
+    font-size: 20px;
+    line-height: 1;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    transition: background 120ms, opacity 120ms;
+  }
+  button:hover:not(:disabled) { background: #1d4ed8; }
+  button:disabled { opacity: 0.35; cursor: not-allowed; }
+
+  .popup {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    right: 54px;
+    max-height: 260px;
+    overflow-y: auto;
+    background: #1f2937;
+    border: 1px solid #374151;
+    border-radius: 12px;
+    box-shadow: 0 -8px 24px rgba(0,0,0,0.45);
+    display: none;
+    z-index: 1000;
+  }
+  .popup.show { display: block; }
+  .popup .item {
+    padding: 10px 14px;
+    cursor: pointer;
+    border-bottom: 1px solid #2a3441;
+  }
+  .popup .item:last-of-type { border-bottom: none; }
+  .popup .item.active { background: #2563eb; }
+  .popup .item .name { font-weight: 600; font-size: 13px; color: #e5e7eb; }
+  .popup .item .desc { color: #9ca3af; font-size: 12px; margin-top: 2px; }
+  .popup .item.active .name,
+  .popup .item.active .desc { color: #fff; }
+  .popup .hint {
+    color: #6b7280; font-size: 11px;
+    padding: 6px 14px;
+    border-top: 1px solid #2a3441;
+    background: #111827;
+    position: sticky; bottom: 0;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="popup" id="popup" role="listbox"></div>
+    <textarea id="ta" rows="1"
+      placeholder="Type your message…   ( / for commands · Enter to send · Shift+Enter for newline )"
+      aria-label="Message"></textarea>
+    <button id="btn" title="Send (Enter)" aria-label="Send">↑</button>
+  </div>
+
+<script>
+(function () {
+  function send(type, data) {
+    var msg = Object.assign({ isStreamlitMessage: true, type: type }, data || {});
+    window.parent.postMessage(msg, "*");
+  }
+  function setValue(value) { send("streamlit:setComponentValue", { value: value, dataType: "json" }); }
+  function setHeight(h) { send("streamlit:setFrameHeight", { height: h }); }
+  function ready() { send("streamlit:componentReady", { apiVersion: 1 }); }
+
+  var ta = document.getElementById("ta");
+  var btn = document.getElementById("btn");
+  var popup = document.getElementById("popup");
+
+  var commands = [];
+  var disabled = false;
+  var filtered = [];
+  var activeIdx = -1;
+  var isComposing = false;  // IME (Korean/Japanese/Chinese) composition state
+
+  function adjustHeight() {
+    ta.style.height = "auto";
+    var h = Math.min(ta.scrollHeight, 220);
+    ta.style.height = h + "px";
+    var wrap = document.querySelector(".wrap");
+    var wrapH = wrap ? wrap.offsetHeight : ta.offsetHeight;
+    // Popup is position:absolute so it doesn't contribute to scrollHeight —
+    // add its height manually so the iframe grows to contain it, otherwise
+    // the popup opens upward and gets clipped at the iframe's top edge.
+    var popupH = popup.classList.contains("show") ? popup.offsetHeight + 6 : 0;
+    var total = wrapH + popupH + 14;
+    setHeight(total);
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return { "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[c];
+    });
+  }
+
+  function filterCommands() {
+    var v = ta.value;
+    if (!v.startsWith("/")) {
+      filtered = [];
+      activeIdx = -1;
+      renderPopup();
+      return;
+    }
+    var q = v.slice(1).toLowerCase().trim();
+    filtered = commands.filter(function (c) {
+      if (!q) return true;
+      return c.name.slice(1).toLowerCase().indexOf(q) !== -1 ||
+             (c.description || "").toLowerCase().indexOf(q) !== -1;
+    }).slice(0, 30);
+    activeIdx = filtered.length ? 0 : -1;
+    renderPopup();
+  }
+
+  function renderPopup() {
+    if (!filtered.length) {
+      popup.classList.remove("show");
+      popup.innerHTML = "";
+      adjustHeight();
+      return;
+    }
+    popup.classList.add("show");
+    var html = filtered.map(function (c, i) {
+      var desc = (c.description || c.source || "").slice(0, 100);
+      return '<div class="item ' + (i === activeIdx ? "active" : "") + '" data-idx="' + i + '" role="option">' +
+        '<div class="name">' + escapeHtml(c.name) + "</div>" +
+        (desc ? '<div class="desc">' + escapeHtml(desc) + "</div>" : "") +
+      "</div>";
+    }).join("");
+    html += '<div class="hint">↑↓ navigate · Enter select · Esc close · Tab autofill</div>';
+    popup.innerHTML = html;
+
+    Array.prototype.forEach.call(popup.querySelectorAll(".item"), function (el) {
+      el.addEventListener("mouseenter", function () {
+        activeIdx = parseInt(el.dataset.idx, 10);
+        Array.prototype.forEach.call(popup.querySelectorAll(".item"), function (x) {
+          x.classList.toggle("active", parseInt(x.dataset.idx, 10) === activeIdx);
+        });
+      });
+      el.addEventListener("mousedown", function (e) {
+        e.preventDefault();
+        var idx = parseInt(el.dataset.idx, 10);
+        submit(filtered[idx].name);
+      });
+    });
+    var active = popup.querySelector(".item.active");
+    if (active && active.scrollIntoView) active.scrollIntoView({ block: "nearest" });
+    adjustHeight();
+  }
+
+  function submit(text) {
+    text = (text || "").trim();
+    if (!text || disabled) return;
+    // Use Date.now() instead of a local counter so values stay strictly increasing
+    // even if the iframe is reloaded (which would reset a counter back to 0
+    // while Python's last-seen value persists, causing all new submissions to
+    // be ignored until the local counter catches back up — the "엔터 카운트 증가" bug).
+    setValue({ text: text, ts: Date.now() });
+    ta.value = "";
+    filtered = [];
+    activeIdx = -1;
+    renderPopup();
+    adjustHeight();
+  }
+
+  // IME composition tracking — Korean/Japanese/Chinese characters
+  // are committed to ta.value only on compositionend, not on each keystroke.
+  ta.addEventListener("compositionstart", function () {
+    isComposing = true;
+  });
+  ta.addEventListener("compositionend", function () {
+    isComposing = false;
+    // ta.value is now fully committed; refresh dependent state.
+    adjustHeight();
+    filterCommands();
+  });
+
+  ta.addEventListener("input", function () {
+    adjustHeight();
+    if (!isComposing) filterCommands();
+  });
+
+  ta.addEventListener("keydown", function (e) {
+    // Only skip during browser-reported IME composition.
+    // Our own isComposing flag can lag if compositionend ever fails to fire,
+    // which would silently swallow every Enter — so we don't gate on it here.
+    if (e.isComposing) return;
+    if (filtered.length > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault(); e.stopPropagation();
+        activeIdx = (activeIdx + 1) % filtered.length;
+        renderPopup();
+        return;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault(); e.stopPropagation();
+        activeIdx = (activeIdx - 1 + filtered.length) % filtered.length;
+        renderPopup();
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault(); e.stopPropagation();
+        filtered = [];
+        activeIdx = -1;
+        renderPopup();
+        return;
+      }
+      if (e.key === "Tab") {
+        e.preventDefault(); e.stopPropagation();
+        if (activeIdx >= 0) {
+          ta.value = filtered[activeIdx].name + " ";
+          filtered = [];
+          activeIdx = -1;
+          renderPopup();
+          adjustHeight();
+        }
+        return;
+      }
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault(); e.stopPropagation();
+        if (activeIdx >= 0) submit(filtered[activeIdx].name);
+        return;
+      }
+    }
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault(); e.stopPropagation();
+      submit(ta.value);
+      return;
+    }
+  });
+  // blur safety: if compositionend was missed for any reason,
+  // reset the flag when the textarea loses focus so it never stays stuck.
+  ta.addEventListener("blur", function () {
+    isComposing = false;
+  });
+
+  btn.addEventListener("click", function () {
+    // Blur textarea to force any pending IME composition to commit synchronously,
+    // then read the now-finalized value on the next tick.
+    var hadFocus = document.activeElement === ta;
+    if (hadFocus) ta.blur();
+    setTimeout(function () {
+      submit(ta.value);
+      if (hadFocus) ta.focus();
+    }, 0);
+  });
+
+  window.addEventListener("message", function (e) {
+    if (!e.data || e.data.type !== "streamlit:render") return;
+    var args = e.data.args || {};
+    commands = Array.isArray(args.commands) ? args.commands : [];
+    var newDisabled = !!args.disabled;
+    var wasDisabled = disabled;
+    if (newDisabled !== disabled) {
+      disabled = newDisabled;
+      ta.disabled = disabled;
+      btn.disabled = disabled;
+    }
+    if (filtered.length) filterCommands();
+    adjustHeight();
+    // When re-enabled (claude finished responding), restore focus so Enter works immediately
+    if (wasDisabled && !disabled) {
+      setTimeout(function () { try { ta.focus(); } catch (_) {} }, 0);
+    }
+  });
+
+  window.addEventListener("resize", adjustHeight);
+
+  ready();
+  adjustHeight();
+  setTimeout(function () {
+    try { ta.focus(); } catch (_) {}
+    adjustHeight();
+  }, 50);
+})();
+</script>
+</body>
+</html>
