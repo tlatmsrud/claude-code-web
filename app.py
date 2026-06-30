@@ -1,6 +1,7 @@
 import json
 import shutil
 import subprocess
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -484,14 +485,23 @@ with st.sidebar:
     working_dir = st.session_state.working_dir
 
     sessions = list_sessions(working_dir)
+    sessions_by_id = {s["id"]: s for s in sessions}
+    NEW_VALUE = "__new_session__"
     NEW_LABEL = "🆕 New session"
 
-    def _fmt_session(s: dict) -> str:
+    def _fmt_option(val: str) -> str:
+        # selectbox options are session ids (guaranteed-unique UUIDs);
+        # only the display label is allowed to collide.
+        if val == NEW_VALUE:
+            return NEW_LABEL
+        s = sessions_by_id.get(val)
+        if not s:
+            return val
         when = datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
         preview = s["last_user"].splitlines()[0][:50]
         return f"{when} · {preview} ({s['msg_count']})"
 
-    labels = [NEW_LABEL] + [_fmt_session(s) for s in sessions]
+    options = [NEW_VALUE] + [s["id"] for s in sessions]
     current = 0
     if st.session_state.resume_session_id:
         for i, s in enumerate(sessions):
@@ -502,19 +512,20 @@ with st.sidebar:
     picker_disabled = st.session_state.pending_prompt is not None
     selected = st.selectbox(
         "Resume session",
-        labels,
+        options,
         index=current,
+        format_func=_fmt_option,
         key=f"session_picker_{working_dir}_{st.session_state.picker_version}",
         disabled=picker_disabled,
         help="Pick a previous session to resume in this directory, or start fresh.",
     )
 
-    if selected == NEW_LABEL:
+    if selected == NEW_VALUE:
         if st.session_state.resume_session_id is not None:
             reset_conversation_state()
             st.rerun()
     else:
-        picked_session = sessions[labels.index(selected) - 1]
+        picked_session = sessions_by_id[selected]
         if st.session_state.resume_session_id != picked_session["id"]:
             st.session_state.resume_session_id = picked_session["id"]
             st.session_state.pending_resume = True
@@ -562,18 +573,28 @@ with st.sidebar:
     elif st.session_state.resume_session_id:
         st.caption(f"Continuing resumed session `{st.session_state.resume_session_id[:8]}…`")
     st.caption(
-        "Core command (now JSON for token tracking):\n\n"
-        "`claude [--resume <id> | -c] --dangerously-skip-permissions -p \"USER INPUT\" --output-format json`"
+        "Core command (streaming for live intermediate output):\n\n"
+        "`claude [--resume <id> | -c] --dangerously-skip-permissions -p \"USER INPUT\" --output-format stream-json --verbose`"
     )
 
 
-def run_claude(
+def run_claude_stream(
     user_input: str,
     cwd: str,
     timeout: int,
     continue_session: bool,
     resume_id: str | None = None,
-) -> tuple[str, float, int, dict | None]:
+):
+    """Generator yielding events from a streaming `claude` invocation.
+
+    Event kinds:
+      - text:        {'text': str}                    — assistant text chunk
+      - tool_use:    {'name': str, 'input': dict}
+      - tool_result: {'is_error': bool, 'content': str}
+      - thinking:    {'text': str}
+      - error:       {'text': str}                    — stderr / cli failure
+      - done:        {'text', 'elapsed', 'code', 'usage'} — terminal
+    """
     started = time.time()
     cmd = ["claude"]
     if resume_id:
@@ -582,38 +603,127 @@ def run_claude(
         cmd.append("-c")
     cmd += [
         "--dangerously-skip-permissions",
-        "-p",
-        user_input,
-        "--output-format",
-        "json",
+        "-p", user_input,
+        "--output-format", "stream-json",
+        "--verbose",
     ]
-    proc = subprocess.run(
+
+    text_parts: list[str] = []
+    final_text: str | None = None
+    usage: dict | None = None
+
+    proc = subprocess.Popen(
         cmd,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=timeout,
         cwd=cwd,
+        bufsize=1,
     )
-    elapsed = time.time() - started
-    if proc.returncode != 0:
-        return proc.stderr.strip() or f"(exit {proc.returncode})", elapsed, proc.returncode, None
+
+    timed_out = {"v": False}
+    def _kill_on_timeout():
+        timed_out["v"] = True
+        try: proc.kill()
+        except Exception: pass
+    timer = threading.Timer(timeout, _kill_on_timeout)
+    timer.start()
 
     try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return proc.stdout.strip(), elapsed, 0, None
+        for line in proc.stdout:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            et = evt.get("type")
 
-    text = (data.get("result") or "").strip()
-    usage = data.get("usage") or {}
-    usage["_cost_usd"] = data.get("total_cost_usd")
-    usage["_duration_ms"] = data.get("duration_ms")
-    model_usage = data.get("modelUsage") or {}
-    usage["_model"] = next(iter(model_usage.keys()), None)
-    return text, elapsed, 0, usage
+            if et == "assistant":
+                for blk in ((evt.get("message") or {}).get("content") or []):
+                    if not isinstance(blk, dict):
+                        continue
+                    bt = blk.get("type")
+                    if bt == "text":
+                        t = blk.get("text") or ""
+                        if t:
+                            text_parts.append(t)
+                            yield {"kind": "text", "text": t}
+                    elif bt == "tool_use":
+                        yield {
+                            "kind": "tool_use",
+                            "name": blk.get("name", "?"),
+                            "input": blk.get("input") or {},
+                        }
+                    elif bt == "thinking":
+                        yield {"kind": "thinking", "text": blk.get("thinking", "")}
+
+            elif et == "user":
+                for blk in ((evt.get("message") or {}).get("content") or []):
+                    if not isinstance(blk, dict) or blk.get("type") != "tool_result":
+                        continue
+                    c = blk.get("content")
+                    if isinstance(c, list):
+                        c = "\n".join(
+                            (b.get("text") if isinstance(b, dict) else str(b))
+                            for b in c if b
+                        )
+                    elif not isinstance(c, str):
+                        c = "" if c is None else str(c)
+                    yield {
+                        "kind": "tool_result",
+                        "is_error": bool(blk.get("is_error")),
+                        "content": (c or "")[:2000],
+                    }
+
+            elif et == "result":
+                u = evt.get("usage") or {}
+                u["_cost_usd"] = evt.get("total_cost_usd")
+                u["_duration_ms"] = evt.get("duration_ms")
+                mu = evt.get("modelUsage") or {}
+                u["_model"] = next(iter(mu.keys()), None)
+                usage = u
+                ft = (evt.get("result") or "").strip()
+                if ft:
+                    final_text = ft
+    finally:
+        timer.cancel()
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            try: proc.kill()
+            except Exception: pass
+
+    return_code = proc.returncode if proc.returncode is not None else -1
+    stderr = ""
+    try:
+        stderr = (proc.stderr.read() or "").strip()
+    except Exception:
+        pass
+
+    if timed_out["v"]:
+        yield {"kind": "error", "text": f"Timed out after {timeout}s"}
+        return_code = -1
+    elif return_code != 0 and stderr:
+        yield {"kind": "error", "text": stderr[:2000]}
+
+    text = (
+        final_text
+        if final_text is not None
+        else "\n".join(p for p in text_parts if p.strip()).strip()
+    )
+    yield {
+        "kind": "done",
+        "text": text,
+        "elapsed": time.time() - started,
+        "code": return_code,
+        "usage": usage,
+    }
 
 
 st.title("🤖 Claude Code Web For MTG")
-st.caption("Streamlit-based non-streaming wrapper for the claude CLI")
+st.caption("Streamlit-based streaming wrapper for the claude CLI")
 
 for msg in st.session_state.messages:
     role = msg["role"]
@@ -682,82 +792,127 @@ if st.session_state.pop("_scroll_bottom", False):
         height=0,
     )
 if result and isinstance(result, dict):
-    # Timestamp-based dedup: JS sends Date.now() per submission. Survives iframe
-    # reloads (which would reset a local counter) since wall-clock time only moves forward.
-    incoming_ts = int(result.get("ts", 0) or 0)
-    last_ts = int(st.session_state.get("_chat_ts", 0))
+    # Nonce-based dedup: each submission carries a fresh UUID. Equality check
+    # (not ordering) means clock skew, iframe reloads, or counter resets
+    # cannot silently swallow new messages — every distinct nonce is "new".
     text = (result.get("text") or "").strip()
-    if text and incoming_ts > last_ts and not is_running:
-        st.session_state._chat_ts = incoming_ts
+    incoming_nonce = result.get("nonce")
+    last_nonce = st.session_state.get("_chat_nonce")
+
+    # Fallback for stale cached HTML that still sends ts only.
+    # Use ts as the dedup key directly (equality, not ordering) so a counter
+    # that resets to 0 on iframe reload doesn't get stuck behind a saved
+    # large value from a previous submission.
+    if incoming_nonce is None:
+        incoming_nonce = f"ts:{result.get('ts')}"
+
+    if text and incoming_nonce and incoming_nonce != last_nonce and not is_running:
+        st.session_state._chat_nonce = incoming_nonce
         _submit_message(text)
 
 if st.session_state.pending_prompt is not None:
     prompt = st.session_state.pending_prompt
     continue_session = not st.session_state.start_new_session
     resume_id = st.session_state.resume_session_id if st.session_state.pending_resume else None
-    with st.spinner("Claude is thinking... (non-streaming, please wait)"):
-        try:
-            output, elapsed, code, usage = run_claude(
-                prompt, working_dir, CLAUDE_TIMEOUT_SEC, continue_session, resume_id=resume_id,
-            )
-            st.session_state.start_new_session = False
-            st.session_state.pending_resume = False
-            if code == 0:
-                meta_extra = ""
-                if usage:
-                    st.session_state.last_usage = usage
-                    st.session_state.totals["input"] += usage.get("input_tokens", 0) or 0
-                    st.session_state.totals["output"] += usage.get("output_tokens", 0) or 0
-                    st.session_state.totals["cache_read"] += usage.get("cache_read_input_tokens", 0) or 0
-                    st.session_state.totals["cache_creation"] += usage.get("cache_creation_input_tokens", 0) or 0
-                    st.session_state.totals["cost_usd"] += usage.get("_cost_usd", 0) or 0
-                    st.session_state.totals["turns"] += 1
-                    in_t = usage.get("input_tokens", 0) or 0
-                    out_t = usage.get("output_tokens", 0) or 0
-                    cr_t = usage.get("cache_read_input_tokens", 0) or 0
-                    cw_t = usage.get("cache_creation_input_tokens", 0) or 0
-                    meta_extra = f" · in:{in_t:,} out:{out_t:,} cache_r:{cr_t:,} cache_w:{cw_t:,}"
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "content": output,
-                        "ts": datetime.now().strftime("%H:%M:%S"),
-                        "meta": f"({elapsed:.1f}s){meta_extra}",
-                    }
-                )
-            else:
-                st.session_state.messages.append(
-                    {
-                        "role": "error",
-                        "content": output,
-                        "ts": datetime.now().strftime("%H:%M:%S"),
-                        "meta": f"(exit {code}, {elapsed:.1f}s)",
-                    }
-                )
-        except subprocess.TimeoutExpired:
-            st.session_state.messages.append(
-                {
-                    "role": "error",
-                    "content": f"Command timed out after {CLAUDE_TIMEOUT_SEC}s.",
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                }
-            )
-        except FileNotFoundError:
-            st.session_state.messages.append(
-                {
-                    "role": "error",
-                    "content": "`claude` CLI not found. Install Claude Code first.",
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                }
-            )
-        except Exception as e:
-            st.session_state.messages.append(
-                {
-                    "role": "error",
-                    "content": f"Unexpected error: {e}",
-                    "ts": datetime.now().strftime("%H:%M:%S"),
-                }
-            )
+
+    # Streaming UI: live-updated assistant bubble + collapsible activity log.
+    bubble = st.empty()
+    activity = st.expander("🔧 Tool calls · thinking · results", expanded=False)
+    accumulated = ""
+    error_lines: list[str] = []
+    final_state: dict = {}
+
+    def _render_bubble(content: str) -> None:
+        body = content if content else "<i style='opacity:0.55'>thinking…</i>"
+        bubble.markdown(
+            f"<div class='chat-bubble-assistant'><b>Claude</b><br>{body}</div>",
+            unsafe_allow_html=True,
+        )
+
+    _render_bubble("")
+
+    try:
+        for evt in run_claude_stream(
+            prompt, working_dir, CLAUDE_TIMEOUT_SEC, continue_session, resume_id=resume_id,
+        ):
+            k = evt["kind"]
+            if k == "text":
+                accumulated += evt["text"]
+                _render_bubble(accumulated)
+            elif k == "tool_use":
+                inp = json.dumps(evt.get("input") or {}, ensure_ascii=False)
+                if len(inp) > 400:
+                    inp = inp[:400] + "…"
+                with activity:
+                    st.markdown(f"🔧 **{evt.get('name','?')}** `{inp}`")
+            elif k == "tool_result":
+                snippet = (evt.get("content") or "")
+                if len(snippet) > 600:
+                    snippet = snippet[:600] + "…"
+                prefix = "❌" if evt.get("is_error") else "✅"
+                with activity:
+                    st.code(f"{prefix} {snippet}", language=None)
+            elif k == "thinking":
+                with activity:
+                    st.markdown(f"💭 _{(evt.get('text','') or '')[:600]}_")
+            elif k == "error":
+                error_lines.append(evt.get("text", ""))
+            elif k == "done":
+                final_state = evt
+                break
+    except FileNotFoundError:
+        final_state = {"text": "`claude` CLI not found. Install Claude Code first.",
+                       "code": -1, "elapsed": 0.0, "usage": None}
+        error_lines.append(final_state["text"])
+    except Exception as e:
+        final_state = {"text": f"Unexpected error: {e}",
+                       "code": -1, "elapsed": 0.0, "usage": None}
+        error_lines.append(str(e))
+
+    # Drop the temporary bubble — the persisted message will re-render on rerun.
+    bubble.empty()
+
+    st.session_state.start_new_session = False
+    st.session_state.pending_resume = False
+
+    code = final_state.get("code", -1)
+    output = (final_state.get("text") or "").strip()
+    elapsed = final_state.get("elapsed", 0.0)
+    usage = final_state.get("usage")
+
+    if code == 0:
+        meta_extra = ""
+        if usage:
+            st.session_state.last_usage = usage
+            st.session_state.totals["input"] += usage.get("input_tokens", 0) or 0
+            st.session_state.totals["output"] += usage.get("output_tokens", 0) or 0
+            st.session_state.totals["cache_read"] += usage.get("cache_read_input_tokens", 0) or 0
+            st.session_state.totals["cache_creation"] += usage.get("cache_creation_input_tokens", 0) or 0
+            st.session_state.totals["cost_usd"] += usage.get("_cost_usd", 0) or 0
+            st.session_state.totals["turns"] += 1
+            in_t = usage.get("input_tokens", 0) or 0
+            out_t = usage.get("output_tokens", 0) or 0
+            cr_t = usage.get("cache_read_input_tokens", 0) or 0
+            cw_t = usage.get("cache_creation_input_tokens", 0) or 0
+            meta_extra = f" · in:{in_t:,} out:{out_t:,} cache_r:{cr_t:,} cache_w:{cw_t:,}"
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": output or "(no text response)",
+                "ts": datetime.now().strftime("%H:%M:%S"),
+                "meta": f"({elapsed:.1f}s){meta_extra}",
+            }
+        )
+    else:
+        msg = output or "\n".join(x for x in error_lines if x) or "(no output)"
+        st.session_state.messages.append(
+            {
+                "role": "error",
+                "content": msg,
+                "ts": datetime.now().strftime("%H:%M:%S"),
+                "meta": f"(exit {code}, {elapsed:.1f}s)" if elapsed else f"(exit {code})",
+            }
+        )
     st.session_state.pending_prompt = None
     st.session_state._scroll_bottom = True
     st.rerun()

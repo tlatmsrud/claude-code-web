@@ -2,6 +2,9 @@
 <html>
 <head>
 <meta charset="utf-8" />
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
+<meta http-equiv="Pragma" content="no-cache" />
+<meta http-equiv="Expires" content="0" />
 <style>
   * { box-sizing: border-box; }
   html, body {
@@ -216,14 +219,28 @@
     adjustHeight();
   }
 
+  function makeNonce() {
+    // Per-submission unique ID. Independent of clock and counter state,
+    // so iframe reloads, system-clock skew, or stale cached HTML can't
+    // produce a collision that gets silently dedup'd on the Python side.
+    try {
+      if (window.crypto && typeof crypto.randomUUID === "function") {
+        return crypto.randomUUID();
+      }
+    } catch (_) {}
+    return (
+      Math.random().toString(36).slice(2) +
+      Math.random().toString(36).slice(2) +
+      Date.now().toString(36)
+    );
+  }
+
   function submit(text) {
     text = (text || "").trim();
     if (!text || disabled) return;
-    // Use Date.now() instead of a local counter so values stay strictly increasing
-    // even if the iframe is reloaded (which would reset a counter back to 0
-    // while Python's last-seen value persists, causing all new submissions to
-    // be ignored until the local counter catches back up — the "엔터 카운트 증가" bug).
-    setValue({ text: text, ts: Date.now() });
+    // Each submission gets a fresh nonce; Python accepts when nonce changes
+    // (equality check, not ordering). Immune to clock skew and counter resets.
+    setValue({ text: text, nonce: makeNonce(), ts: Date.now() });
     ta.value = "";
     filtered = [];
     activeIdx = -1;
