@@ -744,7 +744,7 @@ elif st.session_state.get("_update_info"):
     _info = st.session_state["_update_info"]
     _subject = html.escape((_info.get("subject", "") or "")[:140])
     st.markdown(
-        f"<div style='position: fixed; top: 16px; right: 20px; z-index: 100000;"
+        f"<div style='position: fixed; top: 72px; right: 20px; z-index: 100000;"
         f" background:#1f2937; border:1px solid #22c55e; border-radius:12px;"
         f" padding:14px 18px; max-width:340px; color:#e5e7eb;"
         f" box-shadow:0 8px 28px rgba(0,0,0,0.5); font-size:12.5px;'>"
@@ -762,21 +762,27 @@ elif st.session_state.get("_update_info"):
 
 def _apply_project_pick(picked_path: str) -> None:
     """Add path to recents (LRU cap 5), set working_dir, reset conversation.
-    Also syncs the recent-projects selectbox widget state so the next render
-    won't ping-pong back to the previously-persisted selection."""
+    Also blanks the recent-projects selectbox back to its placeholder so the
+    next click — even on the same item — always fires on_change (Streamlit
+    does not fire on re-selecting the currently-displayed value)."""
     _recents = [p for p in st.session_state.recent_projects if p != picked_path]
     _recents.insert(0, picked_path)
     st.session_state.recent_projects = _recents[:5]
     st.session_state.working_dir = picked_path
-    st.session_state["recent_picker"] = picked_path
+    st.session_state["recent_picker"] = None
     _save_persisted_state()
     reset_conversation_state()
 
 
 def _on_recent_pick_change() -> None:
     picked = st.session_state.get("recent_picker")
-    if picked and picked != st.session_state.working_dir:
+    if not picked:
+        return
+    if picked != st.session_state.working_dir:
         _apply_project_pick(picked)
+    else:
+        # Same project re-picked — just reset the picker so subsequent clicks fire.
+        st.session_state["recent_picker"] = None
 
 
 with st.sidebar:
@@ -809,13 +815,12 @@ with st.sidebar:
             st.rerun()
 
     if st.session_state.recent_projects:
-        _rp = st.session_state.recent_projects
-        _idx = _rp.index(st.session_state.working_dir) if st.session_state.working_dir in _rp else 0
         st.selectbox(
             "최근 프로젝트",
-            _rp,
-            index=_idx,
+            st.session_state.recent_projects,
+            index=None,
             format_func=lambda p: Path(p).name or p,
+            placeholder="— 프로젝트 선택 —",
             key="recent_picker",
             on_change=_on_recent_pick_change,
             help="이전에 선택했던 프로젝트 (최대 5개)",
@@ -874,8 +879,12 @@ with st.sidebar:
 
     st.subheader("Session Tokens")
     t = st.session_state.totals
+    # `input_tokens` alone counts only tokens NOT covered by prompt cache,
+    # so it stays tiny once the session is warmed up. Sum in cache reads +
+    # cache writes so the number reflects the actual context size Claude saw.
+    _input_total = t["input"] + t["cache_read"] + t["cache_creation"]
     col1, col2 = st.columns(2)
-    col1.metric("Input", fmt_k(t["input"]))
+    col1.metric("Input", fmt_k(_input_total))
     col2.metric("Output", fmt_k(t["output"]))
     st.caption(f"Turns: {t['turns']} · Messages: {len(st.session_state.messages)}")
 
