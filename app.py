@@ -286,7 +286,11 @@ def _encode_cwd(path: str) -> str:
     return path.replace("/", "-")
 
 
-def list_sessions(working_dir: str) -> list[dict]:
+def list_sessions(working_dir: str, prioritize_id: str | None = None) -> list[dict]:
+    """Top 10 sessions by mtime. If prioritize_id is given and that session
+    exists but isn't in the top 10, it's appended so the currently-resumed
+    session is always present in the picker options (prevents the selectbox
+    from snapping to 'New session' and silently resetting the conversation)."""
     proj_dir = Path.home() / ".claude" / "projects" / _encode_cwd(working_dir)
     if not proj_dir.exists():
         return []
@@ -320,7 +324,12 @@ def list_sessions(working_dir: str) -> list[dict]:
             "msg_count": msg_count,
         })
     sessions.sort(key=lambda s: s["mtime"], reverse=True)
-    return sessions[:10]
+    top = sessions[:10]
+    if prioritize_id and not any(s["id"] == prioritize_id for s in top):
+        extra = next((s for s in sessions if s["id"] == prioritize_id), None)
+        if extra:
+            top.append(extra)
+    return top
 
 
 def load_session_messages(jsonl_path: str) -> list[dict]:
@@ -828,40 +837,52 @@ with st.sidebar:
 
     working_dir = st.session_state.working_dir
 
-    sessions = list_sessions(working_dir) if working_dir else []
+    sessions = (
+        list_sessions(working_dir, prioritize_id=st.session_state.resume_session_id)
+        if working_dir else []
+    )
     NEW_LABEL = "🆕 New session"
+    NEW_ID = ""  # sentinel value for "new session" (session UUIDs are never empty)
 
-    def _fmt_session(s: dict) -> str:
+    def _fmt_session_option(v: str) -> str:
+        if v == NEW_ID:
+            return NEW_LABEL
+        s = next((s for s in sessions if s["id"] == v), None)
+        if not s:
+            return v[:8] + "…"
         when = datetime.fromtimestamp(s["mtime"]).strftime("%m-%d %H:%M")
         preview = s["last_user"].splitlines()[0][:50]
         return f"{when} · {preview} ({s['msg_count']})"
 
     if working_dir:
-        labels = [NEW_LABEL] + [_fmt_session(s) for s in sessions]
-        current = 0
-        if st.session_state.resume_session_id:
-            for i, s in enumerate(sessions):
-                if s["id"] == st.session_state.resume_session_id:
-                    current = i + 1
-                    break
+        # ⚠️ Options MUST be stable session IDs, not the human-readable labels.
+        # Labels embed mtime + msg_count which change every turn, invalidating
+        # Streamlit's persisted selectbox state — the widget then snaps to the
+        # first option (NEW), and the NEW-branch handler silently resets the
+        # whole conversation (session_id → None, badge → "new", pending input
+        # dropped). Stable IDs keep widget state valid across reruns.
+        option_ids = [NEW_ID] + [s["id"] for s in sessions]
+        _cur = st.session_state.resume_session_id or NEW_ID
+        _idx = option_ids.index(_cur) if _cur in option_ids else 0
 
         picker_disabled = st.session_state.pending_prompt is not None
-        selected = st.selectbox(
+        selected_id = st.selectbox(
             "Resume session",
-            labels,
-            index=current,
+            option_ids,
+            index=_idx,
+            format_func=_fmt_session_option,
             key=f"session_picker_{working_dir}_{st.session_state.picker_version}",
             disabled=picker_disabled,
             help="Pick a previous session to resume in this directory, or start fresh.",
         )
 
-        if selected == NEW_LABEL:
+        if selected_id == NEW_ID:
             if st.session_state.resume_session_id is not None:
                 reset_conversation_state()
                 st.rerun()
         else:
-            picked_session = sessions[labels.index(selected) - 1]
-            if st.session_state.resume_session_id != picked_session["id"]:
+            picked_session = next((s for s in sessions if s["id"] == selected_id), None)
+            if picked_session and st.session_state.resume_session_id != picked_session["id"]:
                 st.session_state.resume_session_id = picked_session["id"]
                 st.session_state.current_session_id = picked_session["id"]
                 st.session_state.pending_resume = True
@@ -1008,7 +1029,7 @@ for i, msg in enumerate(st.session_state.messages):
                     " padding:10px 14px; border-radius:8px; margin:6px 0;"
                     " color:#9ca3af; font-size:13px; line-height:1.55;"
                     " white-space:pre-wrap; word-wrap:break-word;'>"
-                    f"{im['content']}</div>",
+                    f"{html.escape(im['content'])}</div>",
                     unsafe_allow_html=True,
                 )
                 if im.get("ts"):
@@ -1016,7 +1037,15 @@ for i, msg in enumerate(st.session_state.messages):
                         f"<div class='meta' style='margin:0 0 4px 4px;'>{im['ts']}</div>",
                         unsafe_allow_html=True,
                     )
-    st.markdown(f"<div class='{cls}'><b>{label}</b><br>{content}</div>", unsafe_allow_html=True)
+    # ⚠️ content must be html-escaped: an unbalanced `</div>` or a `<script>`
+    # inside a message would otherwise break the bubble wrapper and cascade
+    # into sibling elements — most notably orphaning the chat input widget
+    # which then becomes visually present but unclickable (only page refresh
+    # recovered it because refresh clears the loaded session).
+    st.markdown(
+        f"<div class='{cls}'><b>{label}</b><br>{html.escape(content)}</div>",
+        unsafe_allow_html=True,
+    )
     if ts or meta:
         st.markdown(f"<div class='meta'>{ts} {meta}</div>", unsafe_allow_html=True)
 
