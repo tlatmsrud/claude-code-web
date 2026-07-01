@@ -12,6 +12,23 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ -f "$SCRIPT_DIR/app.py" ] && [ -d "$SCRIPT_DIR/.git" ]; then
   # run.sh가 이미 클론된 저장소 내부에 있음
   APP_DIR="$SCRIPT_DIR"
+elif [ -f "$SCRIPT_DIR/app.py" ]; then
+  # 소스만 받은 상태(app.py는 있는데 .git이 없음) → 현재 디렉토리를 git 저장소로 승격.
+  # 이 과정에서 저장소 상의 파일들은 origin/$DEFAULT_BRANCH 버전으로 덮어써지며,
+  # 저장소에 없는 사용자 로컬 파일(예: 개인 노트, .venv, .env 등)은 그대로 유지됨.
+  APP_DIR="$SCRIPT_DIR"
+  cd "$APP_DIR"
+  echo "[migrate] converting source-only install to git-tracked ($REPO_URL)"
+  git init -q
+  git remote add origin "$REPO_URL" 2>/dev/null || git remote set-url origin "$REPO_URL"
+  if git fetch --quiet origin "$DEFAULT_BRANCH"; then
+    git symbolic-ref HEAD "refs/heads/$DEFAULT_BRANCH"
+    git reset --hard "origin/$DEFAULT_BRANCH"
+    git branch --set-upstream-to "origin/$DEFAULT_BRANCH" "$DEFAULT_BRANCH" 2>/dev/null || true
+    echo "[migrate] done — auto-update is now available"
+  else
+    echo "[warn] fetch failed; keeping local source (auto-update won't work until next successful run)"
+  fi
 elif [ -d "$SCRIPT_DIR/$APP_DIR_NAME/.git" ]; then
   # 같은 위치에 이미 클론된 디렉토리가 있음
   APP_DIR="$SCRIPT_DIR/$APP_DIR_NAME"

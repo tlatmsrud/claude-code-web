@@ -12,6 +12,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 CLAUDE_TIMEOUT_SEC = 6000
+MAX_LOADED_MESSAGES = 50  # cap on messages loaded from a resumed session
 
 _PROJECT_DIR = Path(__file__).parent.resolve()
 
@@ -377,7 +378,15 @@ def load_session_messages(jsonl_path: str) -> list[dict]:
                         msgs.append(msg)
     except Exception:
         pass
-    return _group_intermediate_assistants(msgs)
+    grouped = _group_intermediate_assistants(msgs)
+    # Cap to the most recent MAX_LOADED_MESSAGES. If the slice would leave a
+    # dangling assistant at the top (orphaned reply without its user prompt),
+    # trim leading assistants so the window starts on a user turn.
+    if len(grouped) > MAX_LOADED_MESSAGES:
+        grouped = grouped[-MAX_LOADED_MESSAGES:]
+        while grouped and grouped[0]["role"] != "user":
+            grouped.pop(0)
+    return grouped
 
 
 def _group_intermediate_assistants(msgs: list[dict]) -> list[dict]:
