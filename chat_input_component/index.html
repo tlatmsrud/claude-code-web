@@ -239,13 +239,14 @@
     // be ignored until the local counter catches back up — the "엔터 카운트 증가" bug).
     var payload = { text: text, ts: Date.now() };
     setValue(payload);
-    // Defensive retries: Streamlit's component registry can transiently drop
-    // an iframe registration, causing setValue postMessages to be silently
-    // ignored (console: "Received component message for unregistered
-    // ComponentInstance!"). Re-send ready() to refresh registration, then
-    // resend the payload. Python dedupes by `ts`, so retries are no-ops when
-    // the first send already succeeded.
-    setTimeout(function () { ready(); setValue(payload); }, 120);
+    // Light-touch retries for transient in-flight message loss. NOTE: do NOT
+    // re-send ready() here — Streamlit's contract is that `componentReady`
+    // fires exactly once at mount. Re-sending it makes Streamlit log
+    // "Received component message for unregistered ComponentInstance!"
+    // and can trigger side effects that discard subsequent setValue posts
+    // from this iframe (which is precisely the "input doesn't work" bug).
+    // Python dedupes by `ts`, so identical retries are safe no-ops on success.
+    setTimeout(function () { setValue(payload); }, 120);
     setTimeout(function () { setValue(payload); }, 400);
     ta.value = "";
     filtered = [];
@@ -325,19 +326,24 @@
     isComposing = false;
   });
 
+  // Split into mousedown + click so IME commit happens BEFORE the browser
+  // shifts focus to the button. On mousedown ta still has focus, so blur()
+  // triggers compositionend synchronously; by the time click fires ta.value
+  // holds the finalized text.
+  btn.addEventListener("mousedown", function () {
+    if (document.activeElement === ta) ta.blur();
+  });
   btn.addEventListener("click", function () {
-    // Blur textarea to force any pending IME composition to commit synchronously,
-    // then read the now-finalized value on the next tick.
-    var hadFocus = document.activeElement === ta;
-    if (hadFocus) ta.blur();
+    try { console.debug("[chat_input] btn click", { value: ta.value, disabled: disabled, isComposing: isComposing }); } catch (_) {}
     setTimeout(function () {
       submit(ta.value);
-      if (hadFocus) ta.focus();
+      try { ta.focus(); } catch (_) {}
     }, 0);
   });
 
   window.addEventListener("message", function (e) {
     if (!e.data || e.data.type !== "streamlit:render") return;
+    try { console.debug("[chat_input] ← render", { disabled: !!e.data.args?.disabled, session_id: e.data.args?.session_id }); } catch (_) {}
     var args = e.data.args || {};
     commands = Array.isArray(args.commands) ? args.commands : [];
     var newDisabled = !!args.disabled;
@@ -368,13 +374,13 @@
   });
 
   window.addEventListener("resize", adjustHeight);
-  // Refresh Streamlit's iframe registration on tab focus / visibility restore —
-  // guards against the registry drifting after long idle or tab switches.
-  document.addEventListener("visibilitychange", function () {
-    if (!document.hidden) ready();
-  });
-  window.addEventListener("focus", ready);
 
+  // Send componentReady exactly once at mount — Streamlit's contract.
+  // Do NOT re-send on focus/visibility/etc.; repeated ready() from a live
+  // iframe races with Streamlit's internal registry (it treats late `ready`
+  // messages as coming from an unregistered instance and rejects them,
+  // which can cascade into `setValue` posts from the same iframe also being
+  // dropped — user sees "input silently doesn't work").
   ready();
   adjustHeight();
   setTimeout(function () {

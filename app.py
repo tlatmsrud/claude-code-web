@@ -863,48 +863,60 @@ with st.sidebar:
         preview = s["last_user"].splitlines()[0][:50]
         return f"{when} · {preview} ({s['msg_count']})"
 
+    def _on_session_picker_change() -> None:
+        # Only user-initiated selectbox changes route through here — any
+        # implicit "state snapped to NEW" on rerun (which was the source of the
+        # session→new spurious reset) is skipped entirely.
+        _key = f"session_picker_{st.session_state.working_dir}_{st.session_state.picker_version}"
+        _sel = st.session_state.get(_key)
+        if _sel is None:
+            return
+        if _sel == NEW_ID:
+            if st.session_state.resume_session_id is not None:
+                reset_conversation_state()
+            return
+        # Non-empty ID → user picked a real session
+        if st.session_state.resume_session_id == _sel:
+            return
+        _wd = st.session_state.working_dir
+        _jp = Path.home() / ".claude" / "projects" / _encode_cwd(_wd) / f"{_sel}.jsonl"
+        if not _jp.exists():
+            return
+        st.session_state.resume_session_id = _sel
+        st.session_state.current_session_id = _sel
+        st.session_state.pending_resume = True
+        st.session_state.messages = load_session_messages(str(_jp))
+        st.session_state.totals = {
+            "input": 0, "output": 0, "cache_read": 0,
+            "cache_creation": 0, "cost_usd": 0.0, "turns": 0,
+        }
+        st.session_state.last_usage = None
+        st.session_state.start_new_session = False
+        st.session_state.pending_prompt = None
+        st.session_state._scroll_bottom = True
+
     if working_dir:
-        # ⚠️ Options MUST be stable session IDs, not the human-readable labels.
-        # Labels embed mtime + msg_count which change every turn, invalidating
-        # Streamlit's persisted selectbox state — the widget then snaps to the
-        # first option (NEW), and the NEW-branch handler silently resets the
-        # whole conversation (session_id → None, badge → "new", pending input
-        # dropped). Stable IDs keep widget state valid across reruns.
+        # ⚠️ Options MUST be stable session IDs (not human-readable labels that
+        # embed mtime/msg_count and mutate every turn), AND the resume/reset
+        # logic MUST live in on_change so it fires only on real user picks —
+        # not every rerun. Any body-level `if selected == NEW` check ran
+        # spuriously whenever Streamlit's widget state snapped to the first
+        # option (which happens when the persisted value drops out of options).
         option_ids = [NEW_ID] + [s["id"] for s in sessions]
         _cur = st.session_state.resume_session_id or NEW_ID
         _idx = option_ids.index(_cur) if _cur in option_ids else 0
 
         picker_disabled = st.session_state.pending_prompt is not None
-        selected_id = st.selectbox(
+        st.selectbox(
             "Resume session",
             option_ids,
             index=_idx,
             format_func=_fmt_session_option,
             key=f"session_picker_{working_dir}_{st.session_state.picker_version}",
             disabled=picker_disabled,
+            on_change=_on_session_picker_change,
             help="Pick a previous session to resume in this directory, or start fresh.",
         )
-
-        if selected_id == NEW_ID:
-            if st.session_state.resume_session_id is not None:
-                reset_conversation_state()
-                st.rerun()
-        else:
-            picked_session = next((s for s in sessions if s["id"] == selected_id), None)
-            if picked_session and st.session_state.resume_session_id != picked_session["id"]:
-                st.session_state.resume_session_id = picked_session["id"]
-                st.session_state.current_session_id = picked_session["id"]
-                st.session_state.pending_resume = True
-                st.session_state.messages = load_session_messages(picked_session["path"])
-                st.session_state.totals = {
-                    "input": 0, "output": 0, "cache_read": 0,
-                    "cache_creation": 0, "cost_usd": 0.0, "turns": 0,
-                }
-                st.session_state.last_usage = None
-                st.session_state.start_new_session = False
-                st.session_state.pending_prompt = None
-                st.session_state._scroll_bottom = True
-                st.rerun()
     st.divider()
 
     st.subheader("Session Tokens")
@@ -998,6 +1010,13 @@ def run_claude(
 st.title("🤖 Claude Code Web - MTG-T4")
 st.caption("Streamlit-based non-streaming wrapper for the claude CLI")
 
+# ⚠️ Do NOT `st.stop()` here — chat_input must stay in the delta tree every
+# rerun. If we skip its render even once, Streamlit unmounts the custom
+# component; on the next mount the registerListener useEffect can race the
+# iframe ref (contentWindow undefined at effect time → registration skipped
+# → all future postMessages from the iframe come back as
+# "Received component message for unregistered ComponentInstance!" and are
+# silently dropped, i.e. the "input suddenly stops working" bug).
 if not working_dir:
     st.markdown(
         "<div style='max-width: 520px; margin: 60px auto; padding: 32px;"
@@ -1011,7 +1030,6 @@ if not working_dir:
         " 최근 프로젝트 if you have any.</p></div>",
         unsafe_allow_html=True,
     )
-    st.stop()
 
 for i, msg in enumerate(st.session_state.messages):
     role = msg["role"]
@@ -1075,11 +1093,11 @@ def _submit_message(text: str) -> None:
     st.rerun()
 
 
-all_cmds = discover_slash_commands(working_dir)
+all_cmds = discover_slash_commands(working_dir) if working_dir else []
 result = chat_input(
     commands=all_cmds,
     session_id=st.session_state.current_session_id,
-    disabled=is_running,
+    disabled=is_running or not working_dir,
     key="claude_chat",
 )
 
@@ -1124,11 +1142,14 @@ if result and isinstance(result, dict):
     incoming_ts = int(result.get("ts", 0) or 0)
     last_ts = int(st.session_state.get("_chat_ts", 0))
     text = (result.get("text") or "").strip()
-    if text and incoming_ts > last_ts and not is_running:
+    # Guard on working_dir: chat_input stays rendered even during the gate
+    # (see note above the gate) so we could see a stale value if working_dir
+    # ever transitioned from set→empty. Ignore submissions without a cwd.
+    if text and incoming_ts > last_ts and not is_running and working_dir:
         st.session_state._chat_ts = incoming_ts
         _submit_message(text)
 
-if st.session_state.pending_prompt is not None:
+if working_dir and st.session_state.pending_prompt is not None:
     prompt = st.session_state.pending_prompt
     continue_session = not st.session_state.start_new_session
     resume_id = st.session_state.resume_session_id if st.session_state.pending_resume else None
