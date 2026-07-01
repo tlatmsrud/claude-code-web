@@ -995,7 +995,7 @@ def run_claude(
     return text, elapsed, 0, usage
 
 
-st.title("🤖 Claude Code Web For MTG")
+st.title("🤖 Claude Code Web - MTG-T4")
 st.caption("Streamlit-based non-streaming wrapper for the claude CLI")
 
 if not working_dir:
