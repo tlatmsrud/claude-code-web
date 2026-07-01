@@ -111,9 +111,20 @@
     background: #111827;
     position: sticky; bottom: 0;
   }
+  .session-label {
+    font-size: 10.5px;
+    color: #6b7280;
+    padding: 0 4px 4px 4px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+    user-select: text;
+    letter-spacing: 0.02em;
+  }
+  .session-label .k { color: #4b5563; }
+  .session-label .v { color: #9ca3af; }
 </style>
 </head>
 <body>
+  <div class="session-label" id="sessionLabel" title=""><span class="k">session:</span> <span class="v">new</span></div>
   <div class="wrap">
     <div class="popup" id="popup" role="listbox"></div>
     <textarea id="ta" rows="1"
@@ -126,6 +137,7 @@
 (function () {
   function send(type, data) {
     var msg = Object.assign({ isStreamlitMessage: true, type: type }, data || {});
+    try { console.debug("[chat_input] →", type, data); } catch (_) {}
     window.parent.postMessage(msg, "*");
   }
   function setValue(value) { send("streamlit:setComponentValue", { value: value, dataType: "json" }); }
@@ -152,7 +164,9 @@
     // add its height manually so the iframe grows to contain it, otherwise
     // the popup opens upward and gets clipped at the iframe's top edge.
     var popupH = popup.classList.contains("show") ? popup.offsetHeight + 6 : 0;
-    var total = wrapH + popupH + 14;
+    var label = document.getElementById("sessionLabel");
+    var labelH = label ? label.offsetHeight : 0;
+    var total = wrapH + popupH + labelH + 14;
     setHeight(total);
   }
 
@@ -223,7 +237,16 @@
     // even if the iframe is reloaded (which would reset a counter back to 0
     // while Python's last-seen value persists, causing all new submissions to
     // be ignored until the local counter catches back up — the "엔터 카운트 증가" bug).
-    setValue({ text: text, ts: Date.now() });
+    var payload = { text: text, ts: Date.now() };
+    setValue(payload);
+    // Defensive retries: Streamlit's component registry can transiently drop
+    // an iframe registration, causing setValue postMessages to be silently
+    // ignored (console: "Received component message for unregistered
+    // ComponentInstance!"). Re-send ready() to refresh registration, then
+    // resend the payload. Python dedupes by `ts`, so retries are no-ops when
+    // the first send already succeeded.
+    setTimeout(function () { ready(); setValue(payload); }, 120);
+    setTimeout(function () { setValue(payload); }, 400);
     ta.value = "";
     filtered = [];
     activeIdx = -1;
@@ -324,6 +347,18 @@
       ta.disabled = disabled;
       btn.disabled = disabled;
     }
+    var label = document.getElementById("sessionLabel");
+    if (label) {
+      var sid = args.session_id;
+      if (sid) {
+        label.innerHTML = '<span class="k">session:</span> <span class="v">' +
+          escapeHtml(sid.slice(0, 8)) + "…</span>";
+        label.title = sid;
+      } else {
+        label.innerHTML = '<span class="k">session:</span> <span class="v">new</span>';
+        label.title = "";
+      }
+    }
     if (filtered.length) filterCommands();
     adjustHeight();
     // When re-enabled (claude finished responding), restore focus so Enter works immediately
@@ -333,6 +368,12 @@
   });
 
   window.addEventListener("resize", adjustHeight);
+  // Refresh Streamlit's iframe registration on tab focus / visibility restore —
+  // guards against the registry drifting after long idle or tab switches.
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden) ready();
+  });
+  window.addEventListener("focus", ready);
 
   ready();
   adjustHeight();
