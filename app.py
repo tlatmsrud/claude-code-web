@@ -101,7 +101,7 @@ def chat_input(commands, session_id=None, disabled=False, key="claude_chat"):
     )
 
 st.set_page_config(
-    page_title="Claude Code Web For MTG",
+    page_title="Claude Code Web - MTG-4",
     page_icon="🤖",
     layout="wide",
 )
